@@ -76,7 +76,8 @@ LAST_UP=0
 #   CLICK_GAP_SEC   任意两次点击类请求的最小间隔（120 + 余量）；
 #   RECONFIRM_SEC   距上次成功提速超过该时长，兜底强制重新确认一次；
 #   RETRY_SEC       一轮失败（掉速/瞬时错误/网络问题）后的重试间隔；
-#   BOOST_OK=1      本会话已确认在提速状态，跳过重复下发。
+#   BOOST_OK=1      本会话已确认在提速状态，跳过重复下发；跨进程从 status.json
+#                   继承（仅上一轮 state=running 时才继承，见 _inherit_state）。
 CLICK_GAP_SEC=130
 RECONFIRM_SEC=10800
 RETRY_SEC=300
@@ -147,11 +148,34 @@ _save_cred() {
 # --------------------------- 状态文件（给 LuCI） ------------------------------
 # 从上一份状态文件里继承「最近提速时间」：CLI 单次调用（run-once / up）是新进程，
 # LAST_UP 从 0 开始，不继承就会重复点击、把页面「最近提速」冲掉。
+# 注意只继承 last_up、不继承 boost_ok：_state_write 也会调它，若连 boost_ok 一起
+# 继承，心跳刚失败（513）清掉 BOOST_OK 后写状态时会把旧的 boost_ok=1 复活，
+# 下一轮就不重试了（实测过的坑）。
 _inherit_last_up() {
   [ "${LAST_UP:-0}" = "0" ] && [ -f "$ST_FILE" ] || return 0
   local prev
   prev=$(sed -n 's/.*"last_up":\([0-9][0-9]*\).*/\1/p' "$ST_FILE" 2>/dev/null | head -1)
   [ -n "$prev" ] && LAST_UP="$prev"
+  return 0
+}
+
+# 进程入口（do_run_once / do_up）调用：除 last_up 外还继承「已确认提速」标记。
+# CLI 单次调用是新进程，BOOST_OK 从 0 开始，不继承就会在服务端已提速的状态下
+# 重复点击 upgrade（实测 07:31 手动 run-once 又点了一次）。
+# last_up 在这里**强制**继承（覆盖内存值）：守护进程要能看到手动 run-once / up
+# 的点击，共享同一个 130 秒点击窗口，否则手动点完速守护进程下一轮又发心跳撞 711。
+# BOOST_OK 仅在上一轮 state=running 时继承——心跳刚失败（keepalive_fail）说明
+# 提速状态可能已丢，新进程必须重新点击，不能沿用旧的确认标记。
+_inherit_state() {
+  [ -f "$ST_FILE" ] || return 0
+  local prev st
+  prev=$(sed -n 's/.*"last_up":\([0-9][0-9]*\).*/\1/p' "$ST_FILE" 2>/dev/null | head -1)
+  [ -n "$prev" ] && LAST_UP="$prev"
+  [ "${BOOST_OK:-0}" = "0" ] || return 0
+  st=$(sed -n 's/.*"state":"\([^"]*\)".*/\1/p' "$ST_FILE" 2>/dev/null | head -1)
+  [ "$st" = "running" ] || return 0
+  prev=$(sed -n 's/.*"boost_ok":\([01]\).*/\1/p' "$ST_FILE" 2>/dev/null | head -1)
+  [ "$prev" = "1" ] && BOOST_OK=1
   return 0
 }
 
@@ -163,7 +187,7 @@ _state_write() {
   local dial; dial=$(printf '%s' "${KP_DIAL:-}" | tr -d '"\\')
   mkdir -p "$RUN_DIR"
   cat > "$ST_FILE.$$" <<EOF
-{"ts":$(date +%s),"state":"${state}","cur_down":${CUR_DOWN:-0},"max_down":${MAX_DOWN:-0},"up_cur":${UP_CUR:-0},"up_supported":${UP_SUPPORTED:-0},"errno":"${ERRNO}","msg":"${msg}","province":"${PROVINCE}","sp":"${SP}","dial":"${dial}","userid":"${KP_USERID:-}","has_session":"$([ -n "${KP_SESSION:-}" ] && echo 1 || echo 0)","last_up":${LAST_UP:-0}}
+{"ts":$(date +%s),"state":"${state}","cur_down":${CUR_DOWN:-0},"max_down":${MAX_DOWN:-0},"up_cur":${UP_CUR:-0},"up_supported":${UP_SUPPORTED:-0},"errno":"${ERRNO}","msg":"${msg}","province":"${PROVINCE}","sp":"${SP}","dial":"${dial}","userid":"${KP_USERID:-}","has_session":"$([ -n "${KP_SESSION:-}" ] && echo 1 || echo 0)","last_up":${LAST_UP:-0},"boost_ok":${BOOST_OK:-0}}
 EOF
   mv "$ST_FILE.$$" "$ST_FILE" 2>/dev/null
   chmod 644 "$ST_FILE" 2>/dev/null
@@ -171,7 +195,7 @@ EOF
 
 do_state() {
   _load_cred
-  [ -f "$ST_FILE" ] && cat "$ST_FILE" || echo '{"ts":0,"state":"unknown","cur_down":0,"max_down":0,"up_cur":0,"up_supported":0,"errno":"","msg":"","province":"","sp":"","dial":"","userid":"","has_session":0,"last_up":0}'
+  [ -f "$ST_FILE" ] && cat "$ST_FILE" || echo '{"ts":0,"state":"unknown","cur_down":0,"max_down":0,"up_cur":0,"up_supported":0,"errno":"","msg":"","province":"","sp":"","dial":"","userid":"","has_session":0,"last_up":0,"boost_ok":0}'
 }
 
 # ------------------------------- 工具 ----------------------------------------
@@ -702,7 +726,7 @@ do_status() {
 
 do_up() {
   _load_cred
-  _inherit_last_up
+  _inherit_state
   [ -z "$KP_USERID" ] && _die "未导入凭证"
   [ -z "$KP_SESSION" ] && { _warn "无 sessionID，先尝试续期"; _renew_session || return 1; }
   _query_bandwidth >/dev/null 2>&1
@@ -766,7 +790,7 @@ do_renew() {
 #   3. 711 限流返回 2：不算失败，守护进程等过点击窗口（约 130 秒）重试。
 do_run_once() {
   _load_cred
-  _inherit_last_up
+  _inherit_state
   [ -z "$KP_USERID" ] && { _warn "未导入凭证"; _state_write "no_cred" "未导入凭证"; return 1; }
   [ -z "$KP_SESSION" ] && _renew_session >/dev/null 2>&1
   if ! _query_bandwidth; then

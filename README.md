@@ -5,7 +5,7 @@
 - **仓库**：[github.com/xiaodandaodao/luci-app-NeoKuaiNiao](https://github.com/xiaodandaodao/luci-app-NeoKuaiNiao)
 - **License**：MIT
 - **维护者**：xiaodandaodao
-- **当前版本**：1.2.0（QWRT / OpenWrt 21.02+ 实装验证，`PKGARCH:=all` 纯脚本包）
+- **当前版本**：1.2.1（QWRT / OpenWrt 21.02+ 实装验证，`PKGARCH:=all` 纯脚本包）
 - **依赖**：`luci-base` `rpcd` `uclient-fetch` `openssl-util`；不硬绑 curl
 
 1. **页面内直接登录**（推荐）：在 LuCI 里输账号密码，服务端要求图形验证码时页面显示图片，输 4 个字符即可完成登录；
@@ -82,7 +82,7 @@
 
 ```bash
 # 装包（QWRT 是 opkg；dropbear 无 sftp，别用 scp，走管道）
-cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao_1.2.0-1_all.ipk \
+cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao_1.2.1-1_all.ipk \
   | ssh root@192.168.1.1 'cat > /tmp/kpn.ipk'
 ssh root@192.168.1.1 'opkg install /tmp/kpn.ipk'
 ```
@@ -109,7 +109,7 @@ gzip 魔数、成员名与顺序、`debian-binary` 内容、以及 postinst/prer
 自检方法：
 
 ```bash
-file dist/luci-app-neokuainiao_1.2.0-1_all.ipk   # 应显示 gzip compressed data
+file dist/luci-app-neokuainiao_1.2.1-1_all.ipk   # 应显示 gzip compressed data
 tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 #   ./debian-binary
 #   ./data.tar.gz
@@ -119,7 +119,7 @@ tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 若仍要绕开 opkg，可用随包附送的负载包安装（不写 opkg 数据库，卸载需手工删文件）：
 
 ```bash
-cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao-payload_1.2.0-1.tar.gz \
+cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao-payload_1.2.1-1.tar.gz \
   | ssh root@192.168.1.1 'cat > /tmp/kpn.tar.gz'
 ssh root@192.168.1.1 'tar xzf /tmp/kpn.tar.gz -C / \
   && /etc/init.d/neokuainiao enable \
@@ -216,10 +216,15 @@ neokuainiao login-cancel            # 清掉临时会话（含临时密码）
 ```json
 {"ts":...,"state":"running","cur_down":512000,"max_down":512000,
  "up_cur":40960,"up_supported":0,"errno":"","msg":"",
- "province":"江苏","sp":"电信","dial":"2-...","userid":"...","has_session":"1","last_up":...}
+ "province":"江苏","sp":"电信","dial":"2-...","userid":"...","has_session":"1","last_up":...,"boost_ok":...}
 ```
 
 带宽单位 **Kbps**（`204800` = 200 Mbps）。
+
+`last_up`（最近一次点击类请求的时间戳）和 `boost_ok`（是否已确认在提速状态）会被
+下一次 CLI 调用继承——手动 `run-once`/`up` 是新进程，不继承就会在服务端已提速的
+状态下重复点击 upgrade（1.2.1 修复；`boost_ok` 仅当上一轮 `state=running` 时才继承，
+心跳刚失败说明提速状态可能已丢，必须重新点击）。
 
 `state` 取值：`running` / `up` / `down` / `disabled` / `no_cred` / `no_upgrade` / `up_fail` / `keepalive_fail`。
 
