@@ -93,7 +93,7 @@ gzip 魔数、成员名与顺序、`debian-binary` 内容、以及 postinst/prer
 
 ```bash
 file dist/luci-app-neokuainiao_1.1.9-1_all.ipk   # 应显示 gzip compressed data
-tar tzf dist/luci-app-neokuainiao_1.1.4-1_all.ipk
+tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 #   ./debian-binary
 #   ./data.tar.gz
 #   ./control.tar.gz
