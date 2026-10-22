@@ -1,0 +1,13 @@
+{
+	"admin/services/neokuainiao": {
+		"title": "迅雷快鸟提速",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "neokuainiao/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-neokuainiao" ]
+		}
+	}
+}

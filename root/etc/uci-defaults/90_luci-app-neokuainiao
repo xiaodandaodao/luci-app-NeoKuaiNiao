@@ -1,0 +1,12 @@
+#!/bin/sh
+# 首次安装的初始化：确保凭证目录权限正确
+mkdir -p /etc/neokuainiao
+chmod 700 /etc/neokuainiao
+[ -f /etc/neokuainiao/cred.env ] && chmod 600 /etc/neokuainiao/cred.env
+
+mkdir -p /var/run/neokuainiao
+
+[ -x /usr/libexec/neokuainiao/kpn.sh ] || chmod +x /usr/libexec/neokuainiao/kpn.sh 2>/dev/null
+[ -x /etc/init.d/neokuainiao ] || chmod +x /etc/init.d/neokuainiao 2>/dev/null
+
+exit 0

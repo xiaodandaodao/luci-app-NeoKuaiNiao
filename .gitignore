@@ -1,0 +1,5 @@
+dist/
+.stage/
+*.ipk
+__pycache__/
+.DS_Store

@@ -1,0 +1,23 @@
+{
+	"luci-app-neokuainiao": {
+		"description": "Grant access to NeoKuaiNiao (迅雷快鸟提速)",
+		"read": {
+			"uci": [ "neokuainiao" ],
+			"file": {
+				"/etc/neokuainiao/cred.env": [ "read" ],
+				"/var/run/neokuainiao/*": [ "read" ],
+				"/usr/libexec/neokuainiao/kpn.sh": [ "exec" ],
+				"/etc/init.d/neokuainiao": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "neokuainiao" ],
+			"file": {
+				"/etc/neokuainiao/cred.env": [ "write" ],
+				"/var/run/neokuainiao/*": [ "write" ],
+				"/usr/libexec/neokuainiao/kpn.sh": [ "exec" ],
+				"/etc/init.d/neokuainiao": [ "exec" ]
+			}
+		}
+	}
+}

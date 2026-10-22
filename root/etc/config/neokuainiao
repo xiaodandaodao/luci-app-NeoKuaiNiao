@@ -1,0 +1,4 @@
+config neokuainiao 'main'
+	option enabled '0'
+	option interval '300'
+	option iface ''
