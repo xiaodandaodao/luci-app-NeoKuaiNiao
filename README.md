@@ -5,7 +5,7 @@
 - **仓库**：[github.com/xiaodandaodao/luci-app-NeoKuaiNiao](https://github.com/xiaodandaodao/luci-app-NeoKuaiNiao)
 - **License**：MIT
 - **维护者**：xiaodandaodao
-- **当前版本**：1.1.9（QWRT / OpenWrt 21.02+ 实装验证，`PKGARCH:=all` 纯脚本包）
+- **当前版本**：1.2.0（QWRT / OpenWrt 21.02+ 实装验证，`PKGARCH:=all` 纯脚本包）
 - **依赖**：`luci-base` `rpcd` `uclient-fetch` `openssl-util`；不硬绑 curl
 
 1. **页面内直接登录**（推荐）：在 LuCI 里输账号密码，服务端要求图形验证码时页面显示图片，输 4 个字符即可完成登录；
@@ -22,7 +22,7 @@
 控制面闭环，不碰数据面（提速是运营商侧改带宽模板）：
 
 ```
-探测 portal → 查带宽(can_upgrade) → 下发 upgrade → 定时 keepalive → 掉速/会话失效自动重试
+探测 portal → 查带宽(can_upgrade) → 按需 upgrade → 定时 keepalive → 掉速/会话失效自动重试
 ```
 
 - 常驻由 `procd` 托管，开机自启，异常自动拉起
@@ -30,6 +30,23 @@
 - 请求优先走 WAN 出口（可选绑定接口），避免代理/旁路由导致服务端判「宽带不支持」
 - 不硬绑 curl：QWRT 自带 curl 可能与 libcurl 不匹配（`Error relocating`），
   HTTP 走 `wget`/`nc`/`uclient-fetch`，HTTPS 走 `openssl s_client`
+
+### 心跳与时序（1.2.0 起，据路由器日志 + 参考实现 swjsq.py 修正）
+
+服务端把 `upgrade` 与 `keepalive` 视为**同一类「点击」请求**，最小间隔约 120 秒
+（被限流时响应里明示 `button_data.can_click_time=120`）。因此：
+
+1. **本轮只要点过 upgrade（errno=0/812 成功、2204 失败都算——实测失败同样点亮
+   点击窗口），就不再发心跳**——0 秒后发必被 711 拒，保活白发；加速到期后反被
+   513 判掉速，陷入「重提 → 711 → 掉速」死循环（1.1.9 及之前的实测症状）；
+   保活留给下一轮（间隔 ≥300 秒，必过窗口）；
+2. 重新点击的条件：`BOOST_OK` 未确认 / 心跳判掉速（513、824）/ 距上次成功提速超过
+   3 小时兜底；且距上次点击已过 130 秒（CLI 手动调用同样受此保护）；
+3. 711 限流不计失败（服务端承诺"稍后快鸟将自动为您重新提速"）；守护进程等过点击
+   窗口（约 130 秒）就重试，连续 3 次仍被限流退回 300 秒——重启时 prerm 的 recover
+   会点亮点击窗口，首轮 upgrade 必被 711，靠这个分支在 2 分钟内恢复提速；
+   513/824 掉速与 2204 瞬时错误计入失败，300 秒后重试——与参考实现 `swjsq.py` 的
+   节奏一致（590 秒一轮只发 keepalive、每 ~3 小时才 upgrade 且先 `recover` + 等 20 秒）。
 
 ## 页面内登录（含图形验证码）
 
@@ -65,7 +82,7 @@
 
 ```bash
 # 装包（QWRT 是 opkg；dropbear 无 sftp，别用 scp，走管道）
-cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao_1.1.9-1_all.ipk \
+cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao_1.2.0-1_all.ipk \
   | ssh root@192.168.1.1 'cat > /tmp/kpn.ipk'
 ssh root@192.168.1.1 'opkg install /tmp/kpn.ipk'
 ```
@@ -92,7 +109,7 @@ gzip 魔数、成员名与顺序、`debian-binary` 内容、以及 postinst/prer
 自检方法：
 
 ```bash
-file dist/luci-app-neokuainiao_1.1.9-1_all.ipk   # 应显示 gzip compressed data
+file dist/luci-app-neokuainiao_1.2.0-1_all.ipk   # 应显示 gzip compressed data
 tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 #   ./debian-binary
 #   ./data.tar.gz
@@ -102,7 +119,7 @@ tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 若仍要绕开 opkg，可用随包附送的负载包安装（不写 opkg 数据库，卸载需手工删文件）：
 
 ```bash
-cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao-payload_1.1.9-1.tar.gz \
+cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao-payload_1.2.0-1.tar.gz \
   | ssh root@192.168.1.1 'cat > /tmp/kpn.tar.gz'
 ssh root@192.168.1.1 'tar xzf /tmp/kpn.tar.gz -C / \
   && /etc/init.d/neokuainiao enable \
@@ -163,7 +180,7 @@ neokuainiao login-cancel            # 清掉临时会话（含临时密码）
 | UCI | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `0` | 开启常驻（页面登录成功会自动置 1） |
-| `interval` | `300` | 心跳间隔（秒）；服务端对提速/心跳请求有约 120 秒最小间隔限制（响应里 `can_click_time=120`），设短了会被限流、心跳不被接受，建议 300，最低 120 |
+| `interval` | `300` | 轮询间隔（秒），即两轮「查带宽 → 心跳」之间的等待；服务端对提速/心跳有约 120 秒最小点击间隔（响应里 `can_click_time=120`），提完速的当轮会自动跳过心跳，失败按 300 秒重试。建议 300~900，最低 120 |
 | `iface` | 空 | 出口接口名（如 `pppoe-wan`），仅 curl 可用时生效 |
 
 > ⚠️ **QWRT 的 uci 不支持省略 section 名的简写**：`uci get neokuainiao.enabled` 会直接
@@ -177,8 +194,10 @@ neokuainiao login-cancel            # 清掉临时会话（含临时密码）
 | errno | message | 性质 | 处理 |
 |---|---|---|---|
 | `0` | — | 成功 | 正常 |
-| `812` | `speedup server already speed up` | **成功**（服务器记录该线路已在提速中） | 视为已提速，本会话后续轮次跳过重复下发（`BOOST_OK`），每 10 轮强制确认一次 |
-| `711` | `client request too frequent` | **限流**，非故障；服务端承诺"稍后快鸟将自动为您重新提速" | 不计入 daemon 的失败计数，下一轮重试 |
+| `812` | `speedup server already speed up` | **成功**（服务器记录该线路已在提速中） | 视为已提速，本会话后续轮次跳过重复下发（`BOOST_OK`），距上次提速超过 3 小时才兜底确认一次 |
+| `711` | `client request too frequent` | **限流**，非故障；服务端承诺"稍后快鸟将自动为您重新提速" | 不计失败；守护进程等过点击窗口（约 130 秒）重试，连续 3 次仍被限流则退回 300 秒节奏 |
+| `513` / `824` | speedup closed | **掉速**（服务端已关闭提速） | 清 `BOOST_OK`，下一轮重新下发提速 |
+| `2204` | `启用提速失败#` | 服务端瞬时错误 | 计入失败、300 秒后重试；本轮不再发心跳（刚点过，发了也被 711 拒） |
 | `715` / `717` / `718` | session 失效 | 需续期 | 自动 `_renew_session` 后重试 |
 | `6` | 需要图形验证码 | 登录阶段 | 页面取图，输入 4 个字符 |
 | 其他 | — | 真失败 | `state=up_fail` / `keepalive_fail`，计入失败计数 |
@@ -225,5 +244,5 @@ python3 tools/build_ipk.py           # 输出 dist/luci-app-neokuainiao_<ver>-<r
 | 页面状态一直是「未导入凭证」 | `cred.env` 是否存在、是否含 `KP_USERID`/`KP_PEERID` |
 | `state=no_upgrade` | 线路被判不可提速，或被代理改了源 IP；检查 `iface` 与分流 |
 | `errno=715/717/718` | sessionID 过期，插件自动用 loginKey 续期；持续失败需重新登录 |
-| 心跳总是 `errno=711`（请求太频繁） | 间隔低于服务端下限（约 120s），或每轮重复下发提速增加了请求量；把 `interval` 提到 300 |
-| 提速后过几分钟回落 | 看日志确认心跳是否返回 0；掉速后插件会自动重新下发提速，必要时重新登录换 sessionID |
+| 心跳总是 `errno=711`（请求太频繁） | 间隔低于服务端下限（约 120s），或刚提完速就当轮发心跳（1.2.0 起已自动避开）；若仍频繁，检查是否开着多个页面/脚本在手动触发 |
+| 提速后过几分钟回落 | 看日志确认心跳是否返回 0；`errno=513` 即服务端关闭提速，插件会自动重新下发，必要时重新登录换 sessionID |

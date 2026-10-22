@@ -69,11 +69,18 @@ KP_DIAL="${KP_DIAL:-}"
 CUR_DOWN=0; MAX_DOWN=0; UP_CUR=0; UP_SUPPORTED=0
 ERRNO=""; MSG=""; PROVINCE=""; SP=""
 LAST_UP=0
-# 服务端对"点击类"请求（提速/心跳）有最小间隔限制（响应里 can_click_time=120）。
-# 每轮都重复下发提速只会换来 errno=812「已在提速中」的服务端错误、增加被限流概率，
-# 故已确认在提速状态后跳过重复下发；BOOST_OK=1 表示本会话已确认，
-# CYCLE_N 用于每 10 轮强制重新确认一次（兜底防止服务端状态静默过期）。
-BOOST_OK=0; CYCLE_N=0
+# 服务端把 upgrade / keepalive 视为同一类「点击」请求，有最小间隔限制：被限流时
+# 响应里明示 button_data.can_click_time=120（秒）。实测（2026-10-23 路由器日志）：
+# 提速成功后同一秒发心跳 100% 被 711 拒——心跳白发、加速状态没人保，反而引发
+# 「掉速(513)→重提→2204 风暴」死循环。故：
+#   CLICK_GAP_SEC   任意两次点击类请求的最小间隔（120 + 余量）；
+#   RECONFIRM_SEC   距上次成功提速超过该时长，兜底强制重新确认一次；
+#   RETRY_SEC       一轮失败（掉速/瞬时错误/网络问题）后的重试间隔；
+#   BOOST_OK=1      本会话已确认在提速状态，跳过重复下发。
+CLICK_GAP_SEC=130
+RECONFIRM_SEC=10800
+RETRY_SEC=300
+BOOST_OK=0
 
 # ------------------------------- 日志 ----------------------------------------
 _log()  { echo "[neokuainiao] $*"; logger -t "$LOG_TAG" "$*" 2>/dev/null; }
@@ -138,15 +145,19 @@ _save_cred() {
 }
 
 # --------------------------- 状态文件（给 LuCI） ------------------------------
+# 从上一份状态文件里继承「最近提速时间」：CLI 单次调用（run-once / up）是新进程，
+# LAST_UP 从 0 开始，不继承就会重复点击、把页面「最近提速」冲掉。
+_inherit_last_up() {
+  [ "${LAST_UP:-0}" = "0" ] && [ -f "$ST_FILE" ] || return 0
+  local prev
+  prev=$(sed -n 's/.*"last_up":\([0-9][0-9]*\).*/\1/p' "$ST_FILE" 2>/dev/null | head -1)
+  [ -n "$prev" ] && LAST_UP="$prev"
+  return 0
+}
+
 _state_write() {
   local state="$1" msg="${2:-}"
-  # LAST_UP 是进程内变量，CLI 单次调用（如 status）会从 0 开始，把页面「最近提速」
-  # 冲掉。这里从上一份状态文件里继承，保证跨进程保持。
-  if [ "${LAST_UP:-0}" = "0" ] && [ -f "$ST_FILE" ]; then
-    local prev
-    prev=$(sed -n 's/.*"last_up":\([0-9][0-9]*\).*/\1/p' "$ST_FILE" 2>/dev/null | head -1)
-    [ -n "$prev" ] && LAST_UP="$prev"
-  fi
+  _inherit_last_up
   # 去掉会破坏 JSON 的引号/反斜杠/换行
   msg=$(printf '%s' "$msg" | tr -d '"\\' | tr '\n' ' ')
   local dial; dial=$(printf '%s' "${KP_DIAL:-}" | tr -d '"\\')
@@ -691,9 +702,17 @@ do_status() {
 
 do_up() {
   _load_cred
+  _inherit_last_up
   [ -z "$KP_USERID" ] && _die "未导入凭证"
   [ -z "$KP_SESSION" ] && { _warn "无 sessionID，先尝试续期"; _renew_session || return 1; }
   _query_bandwidth >/dev/null 2>&1
+  # 距上次点击不足服务端限流窗口（约 120s）时，点了也只能换来 711，稍等再点
+  local now; now=$(date +%s)
+  if [ $((now - ${LAST_UP:-0})) -lt "$CLICK_GAP_SEC" ]; then
+    _log "距上次点击不足 ${CLICK_GAP_SEC} 秒（服务端限流窗口），稍后再试"
+    _state_write "running" "点击太频繁，稍后再试"
+    return 0
+  fi
   if ! _do_upgrade; then
     case "$ERRNO" in
       715|717|718)
@@ -736,55 +755,96 @@ do_renew() {
 }
 
 # 一轮完整流程：探测 → 需要则提速 → 心跳
+# 时序规则（2026-10-23 据路由器日志 + 参考实现 swjsq.py 修正，详见 README）：
+#   1. 服务端把 upgrade / keepalive 视为同一类「点击」请求，最小间隔约 120 秒
+#      （711 响应里的 button_data.can_click_time）。**本轮只要点过 upgrade
+#      （errno=0/812 成功、2204 失败都算——实测失败也会点亮窗口），就不再发心跳**：
+#      0 秒后发必被 711 拒，保活白发；加速到期后反被 513 判掉速，陷入
+#      「重提 → 711 → 掉速」死循环。心跳留给下一轮（间隔 ≥300 秒，必过窗口）。
+#   2. 重新点击的条件：BOOST_OK 未确认 / 心跳判掉速（513、824，由心跳分支清标记）/
+#      距上次成功提速超过 RECONFIRM_SEC 兜底；且距上次点击已过 CLICK_GAP_SEC。
+#   3. 711 限流返回 2：不算失败，守护进程等过点击窗口（约 130 秒）重试。
 do_run_once() {
   _load_cred
+  _inherit_last_up
   [ -z "$KP_USERID" ] && { _warn "未导入凭证"; _state_write "no_cred" "未导入凭证"; return 1; }
   [ -z "$KP_SESSION" ] && _renew_session >/dev/null 2>&1
   if ! _query_bandwidth; then
     _state_write "no_upgrade" "${MSG}"
     return 1
   fi
-  CYCLE_N=$((CYCLE_N+1))
-  # 当前带宽未到上限 → 下发提速。
-  # 但服务端对点击类请求限流（can_click_time=120），且已确认在提速状态后重复下发
-  # 只会返回 errno=812「服务器已在提速中」——纯属浪费请求还增加限流概率。
-  # 故 BOOST_OK=1 时跳过，仅每 10 轮强制确认一次；心跳失败（非限流）会清掉 BOOST_OK，
-  # 下一轮自动重新下发。
+  local now; now=$(date +%s)
+  local attempted=0 up_failed=0 up_msg=""
   if [ "${CUR_DOWN:-0}" -lt "${MAX_DOWN:-0}" ]; then
-    if [ "${BOOST_OK:-0}" != "1" ] || [ $((CYCLE_N % 10)) -eq 0 ]; then
+    # 带宽接口恒返回签约带宽（当前 < 上限），是否重新点击不看它，看状态标记
+    local need=0
+    [ "${BOOST_OK:-0}" != "1" ] && need=1
+    [ $((now - ${LAST_UP:-0})) -ge "$RECONFIRM_SEC" ] && need=1
+    if [ "$need" = "1" ] && [ $((now - ${LAST_UP:-0})) -lt "$CLICK_GAP_SEC" ]; then
+      _log "距上次点击不足 ${CLICK_GAP_SEC} 秒（服务端限流窗口），本轮只保活不点击"
+      need=0
+    fi
+    if [ "$need" = "1" ]; then
+      attempted=1
+      local up_ok=0
       if ! _do_upgrade; then
         case "$ERRNO" in
           715|717|718)
-            _renew_session && _do_upgrade ;;
+            _log "sessionID 失效（errno=${ERRNO}），自动续期后重试"
+            if _renew_session && _do_upgrade; then up_ok=1; fi
+            ;;
           711)
-            # 限流：不算失败，稍后快鸟会自动重新提速
-            _log "被限流（errno=711 请求太频繁），稍后自动恢复"
+            # 限流：不算失败，服务端承诺"稍后快鸟将自动为您重新提速"。
+            # 返回 2 让守护进程等过点击窗口（约 130 秒）就重试，别干等一个
+            # 完整轮询间隔——重启时 prerm 的 recover 刚点亮窗口，首轮必被 711。
+            _log "被限流（errno=711 请求太频繁），稍后快鸟会自动重新提速"
             ERRNO=""
             _state_write "running" "限流中，稍后自动恢复"
-            return 0
+            return 2
             ;;
         esac
-        if [ "${ERRNO}" != "0" ] && [ "${ERRNO}" != "812" ]; then
-          _state_write "up_fail" "${MSG}"
-          _warn "提速失败：errno=${ERRNO} ${MSG}"
-          return 1
+        if [ "$up_ok" != "1" ]; then
+          # 2204 等瞬时错误：清确认标记下轮重试；本轮不再发心跳（刚点过）
+          BOOST_OK=0
+          up_failed=1; up_msg="${MSG}"
+          _warn "提速失败：errno=${ERRNO} ${MSG}（下轮重试）"
+        fi
+      else
+        up_ok=1
+      fi
+      if [ "$up_ok" = "1" ]; then
+        # errno=0/812 都说明服务端已确认提速状态
+        BOOST_OK=1
+        LAST_UP="$now"
+        CUR_DOWN="$MAX_DOWN"
+        # errno=812 = "speedup server already speed up"，服务器记录已在提速中，算成功
+        if [ "$ERRNO" = "812" ]; then
+          _log "服务器已在提速状态（errno=812），当前 $(awk -v v="$CUR_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps → 上限 $(awk -v v="$MAX_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps"
+        else
+          _log "已提速（errno=${ERRNO}），当前 $(awk -v v="$CUR_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps → 上限 $(awk -v v="$MAX_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps"
         fi
       fi
-      # errno=0/812 都说明服务端已确认提速状态
-      BOOST_OK=1
-      # errno=812 = "speedup server already speed up"，服务器记录已在提速中，算成功
-      if [ "$ERRNO" = "812" ]; then
-        _log "服务器已在提速状态（errno=812），当前 $(awk -v v="$CUR_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps → 上限 $(awk -v v="$MAX_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps"
-      else
-        _log "已提速（errno=${ERRNO}），当前 $(awk -v v="$CUR_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps → 上限 $(awk -v v="$MAX_DOWN" 'BEGIN{printf "%.0f", v/1024}') Mbps"
-      fi
-      CUR_DOWN="$MAX_DOWN"
     fi
   fi
-  # 心跳
+  # 本轮点过 upgrade（成败不论）就不再发心跳：服务端点击窗口约 120 秒，
+  # 0 秒后发必被 711，发了也白发；下一轮的心跳才有效。
+  if [ "$attempted" = "1" ]; then
+    if [ "$up_failed" = "1" ]; then
+      _state_write "up_fail" "${up_msg}"
+      return 1
+    fi
+    _state_write "running" ""
+    return 0
+  fi
+  if [ $((now - ${LAST_UP:-0})) -lt "$CLICK_GAP_SEC" ]; then
+    # 刚（可能由别的进程）提过速：心跳同样等下一轮，不做无谓点击
+    _log "距上次点击不足 ${CLICK_GAP_SEC} 秒（服务端限流窗口），本轮跳过心跳"
+    _state_write "running" "点击窗口内，跳过本轮心跳"
+    return 0
+  fi
   if ! _do_keepalive; then
     # 711 = "client request too frequent"，服务端限流，明确说"稍后快鸟将自动为您重新提速"，
-    # 属于正常节奏而非故障，不能计入 failures（否则连续 3 次就 sleep 300）。
+    # 属于正常节奏而非故障，不能计入 daemon 的失败计数。
     if [ "$ERRNO" = "711" ]; then
       _log "心跳被限流（errno=711 请求太频繁），稍后快鸟会自动重新提速"
       ERRNO=""
@@ -794,9 +854,15 @@ do_run_once() {
     _warn "心跳失败 errno=${ERRNO}（掉速或会话失效，下一轮会重试）"
     # 心跳被拒（非限流）说明提速状态可能已丢，清掉确认标记让下一轮重新下发
     BOOST_OK=0
-    if [ "$ERRNO" = "715" ] || [ "$ERRNO" = "717" ] || [ "$ERRNO" = "718" ]; then
-      _renew_session >/dev/null 2>&1
-    fi
+    case "$ERRNO" in
+      513|824)
+        # speedup closed：服务端已关闭提速，下一轮重新下发
+        _log "服务端已关闭提速（errno=${ERRNO}），下一轮重新提速"
+        ;;
+      715|717|718)
+        _renew_session >/dev/null 2>&1
+        ;;
+    esac
     _state_write "keepalive_fail" "errno=${ERRNO}"
     return 1
   fi
@@ -806,8 +872,8 @@ do_run_once() {
 
 do_daemon() {
   _log "守护启动 pid=$$"
-  local interval failures
-  failures=0
+  local interval failures limited
+  failures=0; limited=0
   while :; do
     if ! _enabled; then
       _state_write "disabled" "已关闭"
@@ -815,17 +881,34 @@ do_daemon() {
       continue
     fi
     interval=$(_interval)
-    if do_run_once >/dev/null 2>&1; then
-      failures=0
-    else
-      failures=$((failures+1))
-      _log "本轮失败（连续 ${failures} 次），30~300 秒后重试"
-    fi
-    if [ "$failures" -ge 3 ]; then
-      sleep 300
-    else
-      sleep "$interval"
-    fi
+    do_run_once >/dev/null 2>&1
+    case "$?" in
+      0)
+        # 正常（含 711 心跳限流——服务端会自行重提）
+        failures=0; limited=0
+        sleep "$interval"
+        ;;
+      2)
+        # errno=711 点击限流：等过服务端点击窗口尽快重试（对齐参考实现的
+        # “睡 60 秒原状态重试”）；连续多次仍被限流则退回普通重试节奏
+        limited=$((limited+1))
+        if [ "$limited" -ge 3 ]; then
+          _log "连续 ${limited} 次被限流，退回 ${RETRY_SEC} 秒重试"
+          limited=0
+          sleep "$RETRY_SEC"
+        else
+          _log "本轮被限流（errno=711），${CLICK_GAP_SEC} 秒后重试"
+          sleep "$CLICK_GAP_SEC"
+        fi
+        ;;
+      *)
+        # 失败（掉速 513 / 瞬时错误 2204 / 网络问题）尽快重试，
+        # 不让掉速状态干等一个完整轮询间隔
+        failures=$((failures+1))
+        _log "本轮失败（连续 ${failures} 次），${RETRY_SEC} 秒后重试"
+        sleep "$RETRY_SEC"
+        ;;
+    esac
   done
 }
 

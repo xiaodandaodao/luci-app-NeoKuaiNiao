@@ -51,7 +51,8 @@ function runKpn(cmd) {
 		var out = (res.stdout || '').trim();
 		if (res.code !== 0 && !out)
 			out = (res.stderr || '').trim() || ('返回码 ' + res.code);
-		return { ok: res.code === 0, text: out };
+		// rc=2 = 被服务端限流（errno=711），稍后会自动恢复，不算失败
+		return { ok: res.code === 0 || res.code === 2, text: out };
 	}).catch(function (e) {
 		return { ok: false, text: e.message || String(e) };
 	});
@@ -369,8 +370,8 @@ return view.extend({
 		]);
 
 		/* ---------------- 设置表单 ---------------- */
-		var m = new form.Map('neokuainiao', _('迅雷快鸟提速'),
-			_('用上面的账号密码登录（或导入凭证）后开启服务，路由器会常驻保活：查带宽 → 提速 → 心跳，掉速自动重试。'));
+	var m = new form.Map('neokuainiao', _('迅雷快鸟提速'),
+		_('用上面的账号密码登录（或导入凭证）后开启服务，路由器会常驻保活：查带宽 → 按需提速 → 心跳保活，掉速自动重试。'));
 
 		var s = m.section(form.NamedSection, 'main', 'neokuainiao', _('基本设置'));
 		s.anonymous = true;
@@ -379,8 +380,8 @@ return view.extend({
 			_('开启后由 procd 托管常驻，开机自启。'));
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'interval', _('心跳间隔（秒）'),
-			_('两次心跳之间的等待时间。服务端对提速/心跳请求有约 120 秒的最小间隔限制，设得太短会被限流（errno=711）、心跳根本不被接受；建议 300。'));
+	o = s.option(form.Value, 'interval', _('轮询间隔（秒）'),
+		_('两轮处理（查带宽 → 心跳保活）之间的等待时间。服务端把提速/心跳视为同类「点击」请求、最小间隔约 120 秒：提完速的当轮会自动跳过心跳，点击窗口内也只保活不点击；失败（掉速/瞬时错误）按 300 秒重试。建议 300~900。'));
 		o.datatype = 'range(120,3600)';
 		o.placeholder = '300';
 		o.rmempty = false;
