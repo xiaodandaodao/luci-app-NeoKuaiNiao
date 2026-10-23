@@ -788,6 +788,10 @@ do_renew() {
 #   2. 重新点击的条件：BOOST_OK 未确认 / 心跳判掉速（513、824，由心跳分支清标记）/
 #      距上次成功提速超过 RECONFIRM_SEC 兜底；且距上次点击已过 CLICK_GAP_SEC。
 #   3. 711 限流返回 2：不算失败，守护进程等过点击窗口（约 130 秒）重试。
+#   4. 掉速（513/824）返回 3：提速通道被服务端关掉，守护进程等过点击窗口
+#      （130 秒）**立即**重新提速，不干等 RETRY_SEC（300s）。刚失败的那次
+#      心跳/升级本身就是一次「点击」，窗口内立刻重发只会换 711，
+#      故 130 秒是「检测到 513 就直接重试」的物理下限。
 do_run_once() {
   _load_cred
   _inherit_state
@@ -825,6 +829,14 @@ do_run_once() {
             ERRNO=""
             _state_write "running" "限流中，稍后自动恢复"
             return 2
+            ;;
+          513|824)
+            # 提速通道已关：和心跳检出掉速一样，等过点击窗口立即重提。
+            # 刚点过 upgrade，窗口内再点必被 711，故 130 秒后重试。
+            BOOST_OK=0
+            _warn "提速失败：errno=${ERRNO} ${MSG}（${CLICK_GAP_SEC} 秒后立即重试）"
+            _state_write "keepalive_fail" "errno=${ERRNO}"
+            return 3
             ;;
         esac
         if [ "$up_ok" != "1" ]; then
@@ -875,13 +887,17 @@ do_run_once() {
       _state_write "running" "限流中，稍后自动恢复"
       return 0
     fi
-    _warn "心跳失败 errno=${ERRNO}（掉速或会话失效，下一轮会重试）"
+    _warn "心跳失败 errno=${ERRNO}（掉速或会话失效，即将重试）"
     # 心跳被拒（非限流）说明提速状态可能已丢，清掉确认标记让下一轮重新下发
     BOOST_OK=0
     case "$ERRNO" in
       513|824)
-        # speedup closed：服务端已关闭提速，下一轮重新下发
-        _log "服务端已关闭提速（errno=${ERRNO}），下一轮重新提速"
+        # speedup closed：提速通道被服务端关掉。返回 3 让守护进程等过
+        # 点击窗口（130 秒）立即重新提速，别干等 RETRY_SEC——刚发的
+        # 这次心跳已点亮限流窗口，立刻重发 upgrade 只会换 711。
+        _log "服务端已关闭提速（errno=${ERRNO}），${CLICK_GAP_SEC} 秒后立即重新提速"
+        _state_write "keepalive_fail" "掉速，${CLICK_GAP_SEC} 秒后重新提速"
+        return 3
         ;;
       715|717|718)
         _renew_session >/dev/null 2>&1
@@ -896,8 +912,8 @@ do_run_once() {
 
 do_daemon() {
   _log "守护启动 pid=$$"
-  local interval failures limited
-  failures=0; limited=0
+  local interval failures limited drops
+  failures=0; limited=0; drops=0
   while :; do
     if ! _enabled; then
       _state_write "disabled" "已关闭"
@@ -909,7 +925,7 @@ do_daemon() {
     case "$?" in
       0)
         # 正常（含 711 心跳限流——服务端会自行重提）
-        failures=0; limited=0
+        failures=0; limited=0; drops=0
         sleep "$interval"
         ;;
       2)
@@ -922,6 +938,20 @@ do_daemon() {
           sleep "$RETRY_SEC"
         else
           _log "本轮被限流（errno=711），${CLICK_GAP_SEC} 秒后重试"
+          sleep "$CLICK_GAP_SEC"
+        fi
+        ;;
+      3)
+        # 掉速（513/824）：通道被服务端关掉，等过点击窗口立即重新提速，
+        # 不干等 RETRY_SEC；连续多次掉速重提仍未成功则退回普通节奏，
+        # 避免服务端持续拒绝时高频点击
+        drops=$((drops+1))
+        if [ "$drops" -ge 3 ]; then
+          _log "连续 ${drops} 次掉速重提未成功，退回 ${RETRY_SEC} 秒重试"
+          drops=0
+          sleep "$RETRY_SEC"
+        else
+          _log "检测到掉速，${CLICK_GAP_SEC} 秒后立即重新提速"
           sleep "$CLICK_GAP_SEC"
         fi
         ;;

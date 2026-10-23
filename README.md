@@ -5,7 +5,7 @@
 - **仓库**：[github.com/xiaodandaodao/luci-app-NeoKuaiNiao](https://github.com/xiaodandaodao/luci-app-NeoKuaiNiao)
 - **License**：MIT
 - **维护者**：xiaodandaodao
-- **当前版本**：1.2.1（QWRT / OpenWrt 21.02+ 实装验证，`PKGARCH:=all` 纯脚本包）
+- **当前版本**：1.2.2（QWRT / OpenWrt 21.02+ 实装验证，`PKGARCH:=all` 纯脚本包）
 - **依赖**：`luci-base` `rpcd` `uclient-fetch` `openssl-util`；不硬绑 curl
 
 1. **页面内直接登录**（推荐）：在 LuCI 里输账号密码，服务端要求图形验证码时页面显示图片，输 4 个字符即可完成登录；
@@ -45,8 +45,12 @@
 3. 711 限流不计失败（服务端承诺"稍后快鸟将自动为您重新提速"）；守护进程等过点击
    窗口（约 130 秒）就重试，连续 3 次仍被限流退回 300 秒——重启时 prerm 的 recover
    会点亮点击窗口，首轮 upgrade 必被 711，靠这个分支在 2 分钟内恢复提速；
-   513/824 掉速与 2204 瞬时错误计入失败，300 秒后重试——与参考实现 `swjsq.py` 的
-   节奏一致（590 秒一轮只发 keepalive、每 ~3 小时才 upgrade 且先 `recover` + 等 20 秒）。
+   513/824 掉速（提速通道被服务端关掉）走**快速重提**：等过点击窗口（130 秒）
+   立即重新下发 upgrade（1.2.2 起；此前同样 300 秒），连续 3 次仍未成功才退回
+   300 秒；2204 等瞬时错误仍 300 秒后重试。参考实现 `swjsq.py` 也是把掉速当常态
+   兜底（590 秒一轮只发 keepalive、每 ~3 小时才 upgrade 且先 `recover` + 等 20 秒）。
+   掉速瞬间刚发的那次心跳/升级本身已点亮 120 秒限流窗口，窗口内立刻重发只会换
+   711——130 秒是「检测到 513 就直接重试」的物理下限。
 
 ## 页面内登录（含图形验证码）
 
@@ -82,7 +86,7 @@
 
 ```bash
 # 装包（QWRT 是 opkg；dropbear 无 sftp，别用 scp，走管道）
-cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao_1.2.1-1_all.ipk \
+cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao_1.2.2-1_all.ipk \
   | ssh root@192.168.1.1 'cat > /tmp/kpn.ipk'
 ssh root@192.168.1.1 'opkg install /tmp/kpn.ipk'
 ```
@@ -109,7 +113,7 @@ gzip 魔数、成员名与顺序、`debian-binary` 内容、以及 postinst/prer
 自检方法：
 
 ```bash
-file dist/luci-app-neokuainiao_1.2.1-1_all.ipk   # 应显示 gzip compressed data
+file dist/luci-app-neokuainiao_1.2.2-1_all.ipk   # 应显示 gzip compressed data
 tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 #   ./debian-binary
 #   ./data.tar.gz
@@ -119,7 +123,7 @@ tar tzf dist/luci-app-neokuainiao_1.1.9-1_all.ipk
 若仍要绕开 opkg，可用随包附送的负载包安装（不写 opkg 数据库，卸载需手工删文件）：
 
 ```bash
-cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao-payload_1.2.1-1.tar.gz \
+cat luci-app-NeoKuaiNiao/dist/luci-app-neokuainiao-payload_1.2.2-1.tar.gz \
   | ssh root@192.168.1.1 'cat > /tmp/kpn.tar.gz'
 ssh root@192.168.1.1 'tar xzf /tmp/kpn.tar.gz -C / \
   && /etc/init.d/neokuainiao enable \
@@ -250,4 +254,4 @@ python3 tools/build_ipk.py           # 输出 dist/luci-app-neokuainiao_<ver>-<r
 | `state=no_upgrade` | 线路被判不可提速，或被代理改了源 IP；检查 `iface` 与分流 |
 | `errno=715/717/718` | sessionID 过期，插件自动用 loginKey 续期；持续失败需重新登录 |
 | 心跳总是 `errno=711`（请求太频繁） | 间隔低于服务端下限（约 120s），或刚提完速就当轮发心跳（1.2.0 起已自动避开）；若仍频繁，检查是否开着多个页面/脚本在手动触发 |
-| 提速后过几分钟回落 | 看日志确认心跳是否返回 0；`errno=513` 即服务端关闭提速，插件会自动重新下发，必要时重新登录换 sessionID |
+| 提速后过几分钟回落 | 看日志确认心跳是否返回 0；`errno=513` 即服务端关提速（运营商侧会话时效，无法根治），插件自动重新下发——1.2.2 起约 2 分钟内恢复，仍频繁掉速时重新登录换 sessionID 试试 |
